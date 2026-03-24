@@ -1,0 +1,15 @@
+# Jira Data Pipeline
+
+## Overview
+
+Initial version of Jira pipeline using PySpark.
+
+## Features
+
+* Fetch Jira issues via API
+* Transform data using Spark
+* Upsert into Delta table
+
+## Version
+
+* v1_initial → First working pipeline
