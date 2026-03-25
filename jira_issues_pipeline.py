@@ -1,119 +1,195 @@
-import requests
-from requests.auth import HTTPBasicAuth
-from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType
-from delta.tables import DeltaTable
+#Imports + Config
+dbutils.widgets.dropdown("RUN_ISSUES", "true", ["true", "false"])
+dbutils.widgets.dropdown("RUN_SPRINTS", "true", ["true", "false"])
 
-# Load environment variables
+RUN_ISSUES = dbutils.widgets.get("RUN_ISSUES") == "true"
+RUN_SPRINTS = dbutils.widgets.get("RUN_SPRINTS") == "true"
+
+
+PROJECT_KEYS = ["MYJP", "MYK", "MDP"]
+
+from dotenv import load_dotenv
+import os
+
 load_dotenv()
 
 BASE = os.getenv("JIRA_BASE")
 EMAIL = os.getenv("JIRA_EMAIL")
 API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
+workspace.default.workitems_raw
+#Pagination
+def fetch_all_issues(PROJECT_KEYS):
+    issues_total = []
+    next_token = None
+    
+    while True:
+        params = {
+            "jql": f"project={project_key}",
+            "maxResults": 100,
+            "fields": "*all"
+        }
 
-PROJECT_KEY = "MYJP"
+        if next_token:
+            params["nextPageToken"] = next_token
 
-JQL = f"project = {PROJECT_KEY} ORDER BY updated DESC"
-FIELDS = "key,summary,issuetype,status,created,updated,duedate,assignee"
-MAX_RESULTS = 200
+        resp = requests.get(
+            f"{BASE}/rest/api/3/search/jql",
+            params=params,
+            auth=(EMAIL, API_TOKEN),
+            headers={"Accept": "application/json"}
+        )
 
-auth = HTTPBasicAuth(EMAIL, API_TOKEN)
-headers = {"Accept": "application/json"}
-params = {"jql": JQL, "fields": FIELDS, "maxResults": str(MAX_RESULTS)}
+        if resp.status_code != 200:
+            raise Exception(f"[{project_key}] Error {resp.status_code}: {resp.text[:300]}")
 
-resp = requests.get(
-    f"{BASE}/rest/api/3/search/jql",
-    headers=headers,
-    auth=auth,
-    params=params,
-    timeout=60
-)
-resp.raise_for_status()
+        data = resp.json()
+        page_issues = data.get("issues", [])
+        issues_total.extend(page_issues)
 
-data = resp.json()
-issues = data.get("issues", [])
+        print(f"[{project_key}] page={len(page_issues)} total={len(issues_total)}")
 
+        next_token = data.get("nextPageToken")
+        if not next_token:
+            break
+    
+    return issues_total
+
+import urllib.parse
+import requests
+import json
+from pyspark.sql import Row
+
+# Validate credentials are loaded
+if not BASE or not EMAIL or not API_TOKEN:
+    raise ValueError(
+        "Jira credentials not loaded. Ensure BASE, EMAIL, and API_TOKEN are set. "
+        "Check that Cell 4 successfully loaded environment variables from .env file."
+    )
+
+#  Initialize Rows + Timestamp /ISSUE Extraction
 
 rows = []
-for it in issues:
-    f = it.get("fields", {}) or {}
-    rows.append({
-        "issue_key": it.get("key"),
-        "summary": f.get("summary"),
-        "issuetype": (f.get("issuetype") or {}).get("name"),
-        "status": (f.get("status") or {}).get("name"),
-        "created": f.get("created"),
-        "updated": f.get("updated"),
-        "duedate": f.get("duedate"),
-        "assignee": (f.get("assignee") or {}).get("displayName")
-    })
+from datetime import datetime, UTC
+ingestion_ts = datetime.now(UTC).isoformat()# Issue Extraction Loop
 
 
-schema = StructType([
-    StructField("issue_key", StringType(), True),
-    StructField("summary", StringType(), True),
-    StructField("issuetype", StringType(), True),
-    StructField("status", StringType(), True),
-    StructField("created", StringType(), True),
-    StructField("updated", StringType(), True),
-    StructField("duedate", StringType(), True),
-    StructField("assignee", StringType(), True)
-])
+for p in PROJECT_KEYS:
+    jql = urllib.parse.quote(f"project={p}")
+    url = f"{BASE}/rest/api/3/search/jql?jql={jql}&maxResults=100&fields=*all"
 
+    resp = requests.get(url, auth=(EMAIL, API_TOKEN), headers={"Accept": "application/json"})
+    print(f"[{p}] Status:", resp.status_code)
 
-df = spark.createDataFrame(rows, schema=schema) \
-    .withColumn("created_ts", F.to_timestamp("created")) \
-    .withColumn("updated_ts", F.to_timestamp("updated")) \
-    .withColumn("due_dt", F.to_date("duedate")) \
-    .withColumn("load_date", F.current_date())
+    if resp.status_code != 200:
+        print(resp.text[:300])
+        continue
 
-display(df)
-df.createOrReplaceTempView("df"
-                           )
+    issues = resp.json().get("issues", [])
 
-spark.sql("""
-CREATE TABLE IF NOT EXISTS jira_job1 (
-  issue_key  STRING,
-  summary    STRING,
-  issuetype  STRING,
-  status     STRING,
-  created    STRING,
-  updated    STRING,
-  duedate    STRING,
-  assignee   STRING,
-  created_ts TIMESTAMP,
-  updated_ts TIMESTAMP,
-  due_dt     DATE,
-  load_date  DATE
-) USING DELTA
-""")
+    for issue in issues:
+        rows.append(Row(
+            project_key=p,
+            issue_key=issue.get("key"),
+            raw_json=json.dumps(issue),
+            ingestion_ts=ingestion_ts
+        ))
+# Sprint Pagination + Boards Helper (Agile API)
 
+def fetch_all_boards(max_results=50):
+    boards = []
+    start_at = 0
 
+    while True:
+        resp = requests.get(
+            f"{BASE}/rest/agile/1.0/board",
+            params={"startAt": start_at, "maxResults": max_results},
+            auth=(EMAIL, API_TOKEN),
+            headers={"Accept": "application/json"}
+        )
 
-target = DeltaTable.forName(spark, "jira_job1")
+        data = resp.json()
+        page = data.get("values", [])
+        boards.extend(page)
 
-(
-    target.alias("t")
-    .merge(
-        df.alias("s"),
-        "t.issue_key = s.issue_key"
-    )
-    .whenMatchedUpdate(set={
-        "summary": "s.summary",
-        "issuetype": "s.issuetype",
-        "status": "s.status",
-        "created": "s.created",
-        "updated": "s.updated",
-        "duedate": "s.duedate",
-        "assignee": "s.assignee",
-        "created_ts": "s.created_ts",
-        "updated_ts": "s.updated_ts",
-        "due_dt": "s.due_dt",
-        "load_date": "s.load_date"
-    })
-    .whenNotMatchedInsertAll()
-    .execute()
-)
+        if len(page) < max_results:
+            break
+        
+        start_at += max_results
 
-print("UPSERT completed: jira_job1")
+    return boards
+
+#Sprint Pagination
+
+def fetch_all_sprints_for_board(board_id):
+    sprints_total = []
+    start_at = 0   
+
+    while True:
+        params = {
+            "startAt": start_at,
+            "maxResults": 50
+        }
+
+        resp = requests.get(
+            f"{BASE}/rest/agile/1.0/board/{board_id}/sprint",
+            params=params,
+            auth=(EMAIL, API_TOKEN),
+            headers={"Accept": "application/json"}
+        )
+
+        data = resp.json()
+        page_sprints = data.get("values", [])
+        sprints_total.extend(page_sprints)
+
+        if len(page_sprints) < 50:
+            break
+
+        start_at += 50
+    
+    return sprints_total
+# Sprint Extraction
+
+sprint_rows = []
+sprint_ingestion_ts = datetime.now(UTC).isoformat()
+
+# 1. Get all boards
+boards = fetch_all_boards(max_results=50)
+print("Boards found:", len(boards))
+
+# 2. For each board, get all sprints
+for b in boards:
+    board_id = b.get("id")
+    if board_id is None:
+        continue
+
+    sprints = fetch_all_sprints_for_board(board_id, page_size=50)
+
+    for s in sprints:
+        sprint_rows.append(Row(
+            board_id=str(board_id),
+            sprint_id=str(s.get("id")),
+            sprint_name=s.get("name"),
+            state=s.get("state"),
+            start_date=s.get("startDate"),
+            end_date=s.get("endDate"),
+            complete_date=s.get("completeDate"),
+            raw_json=json.dumps(s),
+            ingestion_ts=sprint_ingestion_ts
+        ))
+#Write to Delta Table
+
+if rows:
+    df = spark.createDataFrame(rows)
+    df.write.format("delta").mode("overwrite").saveAsTable("workspace.default.workitems_raw")
+    print("Saved:", df.count())
+else:
+    print("No issues found.") 
+# Write Sprint Data to Delta (Overwrite Bronze)
+
+if sprint_rows:
+    s_df = spark.createDataFrame(sprint_rows)
+    s_df.write.format("delta").mode("overwrite").saveAsTable("workspace.default.sprints_raw")
+    print("Sprints saved:", s_df.count())
+else:
+    print("No sprints found.")
